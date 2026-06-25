@@ -1,14 +1,21 @@
 import asyncio
+import io
+import json
 import logging
 import os
+import queue as _queue
 import re
 import subprocess
 import uuid
+import wave
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import AsyncIterator, Optional
 
 import httpx
-from fastapi import BackgroundTasks, FastAPI, Header, HTTPException
+import numpy as np
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -24,10 +31,14 @@ logger = logging.getLogger("jb-whisper")
 
 SERVICE_KEY = os.getenv("SERVICE_KEY", "change-me-random-string")
 MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "2"))
+HF_TOKEN = os.getenv("HF_TOKEN")
 MAX_AUDIO_BYTES = 500 * 1_024 * 1_024  # 500 MB
 
 AUDIO_DIR = Path("/tmp/audio")
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+
+# Thread pool for CPU-bound work (Whisper + pyannote)
+_thread_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="jb-worker")
 
 # ---------------------------------------------------------------------------
 # Global state
@@ -36,19 +47,20 @@ AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 jobs: dict[str, dict] = {}
 _semaphore: asyncio.Semaphore | None = None  # created on startup (needs running loop)
 
-whisper_model = None  # faster_whisper.WhisperModel
-tts_model = None      # TTS.api.TTS
+whisper_model = None        # faster_whisper.WhisperModel
+tts_model = None            # TTS.api.TTS
+diarization_pipeline = None # pyannote.audio.Pipeline (optional)
 
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="jb-whisper", version="1.0.0")
+app = FastAPI(title="jb-whisper", version="1.1.0")
 
 
 @app.on_event("startup")
 async def _startup() -> None:
-    global whisper_model, tts_model, _semaphore
+    global whisper_model, tts_model, diarization_pipeline, _semaphore
 
     _semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 
@@ -61,6 +73,20 @@ async def _startup() -> None:
     from TTS.api import TTS
     tts_model = TTS("tts_models/nl/css10/vits", gpu=False)
     logger.info("TTS ready.")
+
+    if HF_TOKEN:
+        logger.info("Loading pyannote speaker-diarization-3.1…")
+        try:
+            from pyannote.audio import Pipeline
+            diarization_pipeline = Pipeline.from_pretrained(
+                "pyannote/speaker-diarization-3.1",
+                use_auth_token=HF_TOKEN,
+            )
+            logger.info("Diarization pipeline ready.")
+        except Exception:
+            logger.exception("Failed to load diarization pipeline — continuing without it.")
+    else:
+        logger.info("HF_TOKEN not set — speaker diarization disabled.")
 
 
 # ---------------------------------------------------------------------------
@@ -88,7 +114,7 @@ class TranslateRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers
+# HTTP helpers (unchanged)
 # ---------------------------------------------------------------------------
 
 async def _download(url: str, dest: Path) -> None:
@@ -167,7 +193,6 @@ def _translate_chunks(
 
         for j, seg in enumerate(chunk):
             raw = lines[j] if j < len(lines) else seg["text"]
-            # Strip leading "N. " prefix that the model echoes back
             nl_text = re.sub(r"^\d+\.\s*", "", raw)
             translated.append({"start": seg["start"], "end": seg["end"], "text": nl_text})
 
@@ -190,7 +215,174 @@ def _wav_to_mp3(wav: Path, mp3: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Background job runner
+# WebSocket — session state
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _TranscriptionSession:
+    language: str
+    segments: list[dict] = field(default_factory=list)
+    # All PCM data accumulated for post-processing diarization
+    audio_buffer: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
+    # Running total of audio seconds received (used to offset chunk timestamps)
+    cumulative_offset: float = 0.0
+    # Last N chars of transcript — fed as initial_prompt to improve continuity
+    previous_text: str = ""
+
+
+# ---------------------------------------------------------------------------
+# WebSocket — audio helpers
+# ---------------------------------------------------------------------------
+
+def _decode_wav_bytes(data: bytes) -> np.ndarray:
+    """Decode WAV bytes (16 kHz, mono, int16) → float32 numpy array."""
+    with wave.open(io.BytesIO(data)) as wf:
+        raw = wf.readframes(wf.getnframes())
+    return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32_768.0
+
+
+async def _stream_transcribe_chunk(
+    audio: np.ndarray,
+    language: str,
+    offset: float,
+    initial_prompt: str = "",
+) -> AsyncIterator[dict]:
+    """
+    Async generator — runs faster-whisper in the thread pool and yields each
+    segment dict as soon as the model produces it, keeping the event loop free.
+    """
+    loop = asyncio.get_running_loop()
+    q: asyncio.Queue = asyncio.Queue()
+
+    def _worker() -> None:
+        try:
+            segs, _ = whisper_model.transcribe(
+                audio,
+                language=language,
+                beam_size=3,
+                vad_filter=True,
+                condition_on_previous_text=True,
+                initial_prompt=initial_prompt or None,
+            )
+            for seg in segs:
+                item = {
+                    "start": round(seg.start + offset, 2),
+                    "end": round(seg.end + offset, 2),
+                    "text": seg.text.strip(),
+                }
+                loop.call_soon_threadsafe(q.put_nowait, item)
+        except Exception as exc:
+            loop.call_soon_threadsafe(q.put_nowait, exc)
+        finally:
+            loop.call_soon_threadsafe(q.put_nowait, None)  # sentinel
+
+    future = loop.run_in_executor(_thread_pool, _worker)
+    try:
+        while True:
+            item = await q.get()
+            if item is None:
+                break
+            if isinstance(item, Exception):
+                raise item
+            yield item
+    finally:
+        await future  # always join the thread
+
+
+def _write_wav_temp(audio: np.ndarray, sample_rate: int = 16_000) -> Path:
+    """Write float32 audio to a temp WAV file. Caller is responsible for deletion."""
+    import tempfile
+    tmp = Path(tempfile.mktemp(suffix=".wav"))
+    pcm = (np.clip(audio, -1.0, 1.0) * 32_767).astype(np.int16)
+    with wave.open(str(tmp), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm.tobytes())
+    return tmp
+
+
+# ---------------------------------------------------------------------------
+# WebSocket — diarization helpers
+# ---------------------------------------------------------------------------
+
+def _diarize_sync(audio: np.ndarray) -> list[tuple[float, float, str]]:
+    """
+    Blocking: write audio to temp WAV, run pyannote, return
+    (start, end, "Spreker N") turns sorted by start time.
+    """
+    tmp = _write_wav_temp(audio)
+    try:
+        diarization = diarization_pipeline(str(tmp))
+        speaker_map: dict[str, str] = {}
+        counter = 1
+        turns: list[tuple[float, float, str]] = []
+        for turn, _, raw_label in diarization.itertracks(yield_label=True):
+            if raw_label not in speaker_map:
+                speaker_map[raw_label] = f"Spreker {counter}"
+                counter += 1
+            turns.append((turn.start, turn.end, speaker_map[raw_label]))
+        return turns
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _assign_speakers(
+    segments: list[dict],
+    turns: list[tuple[float, float, str]],
+) -> list[dict]:
+    """
+    For each segment, find the diarization turn with the most timestamp overlap.
+    Falls back to the previous segment's speaker when there is no overlap.
+    """
+    result: list[dict] = []
+    prev_speaker = "Spreker 1"
+    for seg in segments:
+        s, e = seg["start"], seg["end"]
+        best_label, best_overlap = prev_speaker, 0.0
+        for ts, te, label in turns:
+            overlap = max(0.0, min(e, te) - max(s, ts))
+            if overlap > best_overlap:
+                best_overlap, best_label = overlap, label
+        prev_speaker = best_label
+        result.append({**seg, "speaker": best_label})
+    return result
+
+
+# ---------------------------------------------------------------------------
+# WebSocket — stop handler
+# ---------------------------------------------------------------------------
+
+async def _handle_stop(
+    websocket: WebSocket,
+    session: _TranscriptionSession,
+    conn_id: str,
+) -> None:
+    await websocket.send_json({
+        "type": "processing",
+        "message": "Spreker detectie wordt uitgevoerd...",
+    })
+
+    updated = list(session.segments)  # defensive copy
+
+    if diarization_pipeline is not None and session.audio_buffer.size > 0:
+        try:
+            turns = await asyncio.to_thread(_diarize_sync, session.audio_buffer)
+            updated = _assign_speakers(updated, turns)
+            logger.info("[ws:%s] Diarization complete: %d speaker turns", conn_id, len(turns))
+        except Exception:
+            logger.exception("[ws:%s] Diarization failed — keeping Spreker 1 for all", conn_id)
+            # updated already has "Spreker 1" from the real-time phase; keep it
+    else:
+        reason = "no HF_TOKEN" if diarization_pipeline is None else "empty audio buffer"
+        logger.info("[ws:%s] Diarization skipped (%s)", conn_id, reason)
+
+    await websocket.send_json({"type": "speakers_updated", "segments": updated})
+    await websocket.send_json({"type": "done"})
+
+
+# ---------------------------------------------------------------------------
+# Background job runner (unchanged)
 # ---------------------------------------------------------------------------
 
 async def _run_translate_job(job_id: str, req: TranslateRequest) -> None:
@@ -254,7 +446,7 @@ async def _run_translate_job(job_id: str, req: TranslateRequest) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Routes
+# HTTP routes (unchanged)
 # ---------------------------------------------------------------------------
 
 @app.get("/health")
@@ -310,3 +502,112 @@ async def get_audio(
     if not path.exists():
         raise HTTPException(404, "Audio file not found")
     return FileResponse(str(path), media_type="audio/mpeg", filename=f"{job_id}.mp3")
+
+
+# ---------------------------------------------------------------------------
+# WebSocket route
+# ---------------------------------------------------------------------------
+
+@app.websocket("/ws/transcribe")
+async def ws_transcribe(websocket: WebSocket) -> None:
+    """
+    Real-time meeting transcription with post-processing speaker diarization.
+
+    Connect: ws://host/ws/transcribe?key=SERVICE_KEY&lang=nl
+    Send:    binary WAV frames (16 kHz, mono, int16, ~2 s each)
+             OR JSON {"type": "stop"} to end the session
+    Receive: {"type": "segment",          "text": "...", "speaker": "Spreker 1", "start": 0.0, "end": 2.0}
+             {"type": "partial",          "text": "..."}       — interim segment
+             {"type": "processing",       "message": "..."}    — diarization started
+             {"type": "speakers_updated", "segments": [...]}   — final with speaker labels
+             {"type": "done"}                                  — session complete
+    """
+    # Auth via query param (WebSocket handshake can't carry custom headers easily)
+    key = websocket.query_params.get("key", "")
+    lang = websocket.query_params.get("lang", "nl")
+
+    await websocket.accept()
+
+    if key != SERVICE_KEY:
+        await websocket.close(code=1008, reason="Invalid service key")
+        return
+
+    conn_id = str(uuid.uuid4())[:8]
+    logger.info("[ws:%s] Connected — lang=%s", conn_id, lang)
+
+    session = _TranscriptionSession(language=lang)
+
+    try:
+        while True:
+            try:
+                msg = await websocket.receive()
+            except WebSocketDisconnect:
+                logger.info("[ws:%s] Client disconnected", conn_id)
+                break
+
+            if msg["type"] == "websocket.disconnect":
+                logger.info("[ws:%s] Received disconnect frame", conn_id)
+                break
+
+            raw_bytes: bytes | None = msg.get("bytes")
+            raw_text: str | None = msg.get("text")
+
+            # ── Binary frame: audio chunk ────────────────────────────────
+            if raw_bytes:
+                try:
+                    audio_chunk = _decode_wav_bytes(raw_bytes)
+                except Exception as exc:
+                    logger.warning("[ws:%s] WAV decode error, skipping frame: %s", conn_id, exc)
+                    continue
+
+                chunk_offset = session.cumulative_offset
+                session.cumulative_offset += len(audio_chunk) / 16_000.0
+                session.audio_buffer = np.concatenate([session.audio_buffer, audio_chunk])
+
+                try:
+                    async for seg in _stream_transcribe_chunk(
+                        audio_chunk,
+                        session.language,
+                        chunk_offset,
+                        session.previous_text,
+                    ):
+                        if not seg["text"]:
+                            continue
+
+                        # Update context for next chunk
+                        session.previous_text = (
+                            session.previous_text + " " + seg["text"]
+                        )[-500:]
+
+                        seg["speaker"] = "Spreker 1"
+                        session.segments.append(seg)
+
+                        await websocket.send_json({
+                            "type": "segment",
+                            "text": seg["text"],
+                            "speaker": "Spreker 1",
+                            "start": seg["start"],
+                            "end": seg["end"],
+                        })
+
+                except Exception:
+                    logger.exception("[ws:%s] Transcription error — skipping chunk", conn_id)
+                    # Don't close; let the session continue
+
+            # ── Text frame: control message ──────────────────────────────
+            elif raw_text:
+                try:
+                    ctrl = json.loads(raw_text)
+                except json.JSONDecodeError:
+                    logger.warning("[ws:%s] Received non-JSON text, ignoring", conn_id)
+                    continue
+
+                if ctrl.get("type") == "stop":
+                    await _handle_stop(websocket, session, conn_id)
+                    break
+
+    finally:
+        # Free memory regardless of how the connection ended
+        session.segments.clear()
+        del session.audio_buffer
+        logger.info("[ws:%s] Session cleaned up", conn_id)

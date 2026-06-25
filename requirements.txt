@@ -5,3 +5,9 @@ pydantic==2.7.4
 openai==1.35.3
 faster-whisper==1.0.3
 TTS==0.22.0
+numpy>=1.24.0
+# pyannote — torch must be pre-installed from the CPU wheel before these land
+pyannote.audio>=3.1.0
+pyannote.core>=5.0.0
+torch
+torchaudio

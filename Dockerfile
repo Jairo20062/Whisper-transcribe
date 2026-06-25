@@ -1,4 +1,4 @@
-# ---- Build stage: pre-download heavy models --------------------------------
+# ---- Build stage: install deps and pre-download heavy models ---------------
 FROM python:3.11-slim AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -10,16 +10,30 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY requirements.txt .
+
+# Install CPU-only torch first so neither TTS nor pyannote pulls in CUDA weights.
+# The +cpu local-version suffix satisfies torch>=x.y.z requirements from both packages.
+RUN pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+# Install remaining dependencies (torch already present, pip skips it)
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Download Whisper large-v3 (~3 GB) at build time so startup is instant.
-# Models land in /root/.cache/huggingface/hub/
+# Pre-download Whisper large-v3 (~3 GB) so container startup is instant.
+# Model lands in /root/.cache/huggingface/hub/
 RUN python -c "from faster_whisper import WhisperModel; WhisperModel('large-v3', device='cpu', compute_type='int8')"
 
-# Download Coqui TTS nl/css10/vits model (~100 MB).
-# Models land in /root/.local/share/tts/
+# Pre-download Coqui TTS nl/css10/vits (~100 MB).
+# Model lands in /root/.local/share/tts/
 ENV TTS_HOME=/root/.local/share/tts
 RUN python -c "from TTS.api import TTS; TTS('tts_models/nl/css10/vits', gpu=False)"
+
+# NOTE: pyannote/speaker-diarization-3.1 requires a Hugging Face token and
+# cannot be downloaded at build time. It is fetched on first use and cached in
+# /root/.cache/huggingface — mount this path as a Docker volume so the model
+# persists across redeploys:
+#
+#   docker run -v hf-cache:/root/.cache/huggingface jb-whisper
+#   (Coolify: add a persistent volume mapped to /root/.cache/huggingface)
 
 # ---- Runtime stage ---------------------------------------------------------
 FROM python:3.11-slim
@@ -30,7 +44,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Copy installed packages and cached models from builder
+# Copy installed packages and pre-downloaded model caches from builder
 COPY --from=builder /usr/local/lib/python3.11 /usr/local/lib/python3.11
 COPY --from=builder /usr/local/bin /usr/local/bin
 COPY --from=builder /root/.cache /root/.cache
