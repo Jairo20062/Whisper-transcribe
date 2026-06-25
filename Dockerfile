@@ -14,16 +14,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Download Whisper large-v3 (~3 GB) at build time so startup is instant.
 # Models land in /root/.cache/huggingface/hub/
-RUN python -c "\
-from faster_whisper import WhisperModel; \
-WhisperModel('large-v3', device='cpu', compute_type='int8')"
+RUN python -c "from faster_whisper import WhisperModel; WhisperModel('large-v3', device='cpu', compute_type='int8')"
 
 # Download Coqui TTS nl/css10/vits model (~100 MB).
 # Models land in /root/.local/share/tts/
 ENV TTS_HOME=/root/.local/share/tts
-RUN python -c "\
-from TTS.api import TTS; \
-TTS('tts_models/nl/css10/vits', gpu=False)"
+RUN python -c "from TTS.api import TTS; TTS('tts_models/nl/css10/vits', gpu=False)"
 
 # ---- Runtime stage ---------------------------------------------------------
 FROM python:3.11-slim
